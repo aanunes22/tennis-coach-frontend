@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tennis Coach</title>
+
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 980px; margin: 20px auto; padding: 0 10px; }
+    fieldset { margin-bottom: 12px; padding: 10px; border-radius: 6px; }
+    input, textarea, button, select { margin: 4px 0; }
+    .hidden { display: none; }
+    #status { font-weight: bold; margin-top: 6px; }
+    #validation { color: #b00020; font-weight: bold; margin-top: 6px; }
+    hr { margin: 18px 0; }
+    .card { border: 1px solid #ddd; padding: 10px; margin: 10px 0; border-radius: 6px; }
+    small { color: #555; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .row > * { flex: 1; min-width: 180px; }
+    button[disabled] { opacity: 0.6; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+<h2>Tennis Coach</h2>
+
+<form id="form">
+
+  <fieldset>
+    <legend>Tipo de jogo</legend>
+    <label><input type="radio" name="matchType" value="friendly" checked> Amistoso (1 set)</label><br/>
+    <label><input type="radio" name="matchType" value="bestOf3"> Melhor de 3</label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Jogadores</legend>
+    <div class="row">
+      <input id="playerA" placeholder="Seu nome" required />
+      <input id="playerB" placeholder="Adversário" required />
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend id="set1Legend">Set único (amistoso)</legend>
+    <div class="row">
+      <input id="s1a" type="number" min="0" max="7" placeholder="Você (0-7)" />
+      <input id="s1b" type="number" min="0" max="7" placeholder="Adv. (0-7)" />
+    </div>
+
+    <div id="tb1Box" class="hidden">
+      <small>Tie-break Set 1 (>=7, vence por 2)</small>
+      <div class="row">
+        <input id="tb1a" type="number" min="0" max="30" placeholder="TB Você" />
+        <input id="tb1b" type="number" min="0" max="30" placeholder="TB Adv." />
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset id="set2Box" class="hidden">
+    <legend>Set 2</legend>
+    <div class="row">
+      <input id="s2a" type="number" min="0" max="7" placeholder="Você (0-7)" />
+      <input id="s2b" type="number" min="0" max="7" placeholder="Adv. (0-7)" />
+    </div>
+
+    <div id="tb2Box" class="hidden">
+      <small>Tie-break Set 2 (>=7, vence por 2)</small>
+      <div class="row">
+        <input id="tb2a" type="number" min="0" max="30" placeholder="TB Você" />
+        <input id="tb2b" type="number" min="0" max="30" placeholder="TB Adv." />
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset id="set3Box" class="hidden">
+    <legend>Set 3 - Super Tie-break</legend>
+    <small>Super (>=10, vence por 2)</small>
+    <div class="row">
+      <input id="s3a" type="number" min="0" max="30" placeholder="Você" />
+      <input id="s3b" type="number" min="0" max="30" placeholder="Adv." />
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Comentários</legend>
+    <textarea id="comments" placeholder="Observações da partida"></textarea>
+  </fieldset>
+
+  <p id="status">Status: Incompleto</p>
+  <p id="validation"></p>
+
+  <button id="saveBtn" type="submit">Salvar partida</button>
+</form>
+
+<hr/>
+
+<h3>Visualizar partidas</h3>
+<div class="row">
+  <input id="month" placeholder="YYYY-MM (ex: 2026-03)" />
+  <button id="load" type="button">Buscar</button>
+</div>
+
+<div id="games"></div>
+
+<hr/>
+
+<h3>AI Insights (Simples)</h3>
+<div class="row">
+  <select id="opponentFilter">
+    <option value="">Geral (jogos carregados)</option>
+  </select><button id="refreshInsights" type="button">Atualizar insights</button>
+</div>
+<div id="aiInsights" class="card">Carregue jogos (Buscar) para gerar insights.</div>
+
+<script>
+  const API = "https://tennis-coach-api-mvp.azurewebsites.net";
+  const $ = (id) => document.getElementById(id);
+
+  let loadedMatches = [];
+
+  // --- helpers ---
+  const n = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
+  const clamp = (v, min, max) => v === null ? null : Math.max(min, Math.min(max, v));
+  const normalize = (v) => (v || "").trim().toLowerCase();
+  const isTieBreakSetScore = (a, b) => (a === 7 && b === 6) || (a === 6 && b === 7);
+
+  function breakerComplete(a, b, target) {
+    if (a === null || b === null) return false;
+    if (a === b) return false;
+    const diff = Math.abs(a - b);
+    const maxv = Math.max(a, b);
+    return maxv >= target && diff >= 2;
+  }
+
+  function breakerError(a, b, target, label) {
+    if (a === null || b === null) return label + ": preencha os 2 valores.";
+    if (a === b) return label + ": não pode empatar.";
+    const diff = Math.abs(a - b);
+    const maxv = Math.max(a, b);
+    if (maxv < target) return label + ": precisa chegar em " + target + ".";
+    if (diff < 2) return label + ": precisa vencer por 2 (ex: " + target + "-" + (target - 2) + ", 8-6, 12-10).";
+    return "";
+  }
+
+  // --- compute match state from form ---
+  function computeMatch() {
+    const type = document.querySelector('input[name="matchType"]:checked').value;
+
+    const s1a = clamp(n($("s1a").value), 0, 7);
+    const s1b = clamp(n($("s1b").value), 0, 7);
+    const s2a = clamp(n($("s2a").value), 0, 7);
+    const s2b = clamp(n($("s2b").value), 0, 7);
+
+    const tb1a = clamp(n($("tb1a").value), 0, 30);
+    const tb1b = clamp(n($("tb1b").value), 0, 30);
+    const tb2a = clamp(n($("tb2a").value), 0, 30);
+    const tb2b = clamp(n($("tb2b").value), 0, 30);
+
+    const s3a = clamp(n($("s3a").value), 0, 30);
+    const s3b = clamp(n($("s3b").value), 0, 30);
+
+    const needsTB1 = isTieBreakSetScore(s1a, s1b);
+    const needsTB2 = (type === "bestOf3") && isTieBreakSetScore(s2a, s2b);
+
+    const tb1Valid = !needsTB1 || breakerComplete(tb1a, tb1b, 7);
+    const tb2Valid = !needsTB2 || breakerComplete(tb2a, tb2b, 7);
+
+    const set1HasScore = (s1a !== null && s1b !== null && s1a !== s1b);
+    const set2HasScore = (s2a !== null && s2b !== null && s2a !== s2b);
+
+    // A set only counts as "complete" if TB is valid when needed
+    const set1Complete = set1HasScore && tb1Valid;
+    const set2Complete = (type === "bestOf3") ? (set2HasScore && tb2Valid) : false;
+
+    let setsA = 0, setsB = 0;
+    if (set1Complete) { if (s1a > s1b) setsA++; else setsB++; }
+    if (set2Complete) { if (s2a > s2b) setsA++; else setsB++; }
+
+    const superNeeded = (type === "bestOf3" && setsA === 1 && setsB === 1);
+    const superValid = !superNeeded || breakerComplete(s3a, s3b, 10);
+
+    // validation message priority
+    let validation = "";
+    if (needsTB1 && !tb1Valid) validation = breakerError(tb1a, tb1b, 7, "Tie-break Set 1");
+    else if (needsTB2 && !tb2Valid) validation = breakerError(tb2a, tb2b, 7, "Tie-break Set 2");
+    else if (superNeeded && !superValid) validation = breakerError(s3a, s3b, 10, "Super Tie-break");
+
+    // status + winner
+    let status = "Incompleto";
+    let winner = null;
+
+    if (type === "friendly") {
+      if (set1HasScore && !validation) {
+        status = "Finalizado";
+        winner = (s1a > s1b) ? "playerA" : "playerB";
+      } else if (s1a !== null && s1b !== null) {
+        status = "Em andamento";
+      }
+    } else {
+      if ((setsA === 2 || setsB === 2) && !validation) {
+        status = "Finalizado";
+        winner = setsA === 2 ? "playerA" : "playerB";
+      } else if (superNeeded) {
+        if (!validation && superValid && s3a !== null && s3b !== null && s3a !== s3b) {
+          status = "Finalizado";
+          winner = (s3a > s3b) ? "playerA" : "playerB";
+        } else {
+          status = "Em andamento";
+        }
+      } else if (setsA + setsB >= 1) {
+        status = "Em andamento";
+      }
+    }
+
+    return {
+      type,
+      s1a, s1b, s2a, s2b,
+      tb1a, tb1b, tb2a, tb2b,
+      s3a, s3b,
+      needsTB1, needsTB2, superNeeded,
+      set1HasScore, set2HasScore,
+      status, winner,
+      validation
+    };
+  }
+
+  // --- UI ---
+  function updateUI() {
+    const type = document.querySelector('input[name="matchType"]:checked').value;
+
+    $("set1Legend").innerText = (type === "friendly") ? "Set único (amistoso)" : "Set 1";
+    $("set2Box").classList.toggle("hidden", type === "friendly");
+
+    if (type === "friendly") {
+      $("s2a").value = ""; $("s2b").value = "";
+      $("tb2a").value = ""; $("tb2b").value = "";
+      $("tb2Box").classList.add("hidden");
+      $("s3a").value = ""; $("s3b").value = "";
+      $("set3Box").classList.add("hidden");
+    }
+
+    const m = computeMatch();
+
+    $("tb1Box").classList.toggle("hidden", !m.needsTB1);
+    if (!m.needsTB1) { $("tb1a").value = ""; $("tb1b").value = ""; }
+
+    $("tb2Box").classList.toggle("hidden", !m.needsTB2);
+    if (!m.needsTB2) { $("tb2a").value = ""; $("tb2b").value = ""; }
+
+    $("set3Box").classList.toggle("hidden", !m.superNeeded);
+    if (!m.superNeeded) { $("s3a").value = ""; $("s3b").value = ""; }
+
+    let winnerName = "";
+    if (m.winner === "playerA") winnerName = $("playerA").value || "";
+    if (m.winner === "playerB") winnerName = $("playerB").value || "";
+
+    $("status").innerText = "Status: " + m.status + (winnerName ? (" | Vencedor: " + winnerName) : "");
+    $("validation").innerText = m.validation || "";
+    $("saveBtn").disabled = !!m.validation;
+  }
+
+  // --- POST ---
+  $("form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const m = computeMatch();
+
+    if (m.validation) {
+      alert(m.validation);
+      return;
+    }
+
+    const sets = [];
+
+    // Set 1
+    if (m.set1HasScore) {
+      const set1 = { setNumber: 1, playerAScore: m.s1a, playerBScore: m.s1b };
+      if (m.needsTB1) set1.tieBreak = { playerAScore: m.tb1a, playerBScore: m.tb1b };
+      sets.push(set1);
+    }
+
+    // Set 2 (bestOf3)
+    if (m.type === "bestOf3" && m.set2HasScore) {
+      const set2 = { setNumber: 2, playerAScore: m.s2a, playerBScore: m.s2b };
+      if (m.needsTB2) set2.tieBreak = { playerAScore: m.tb2a, playerBScore: m.tb2b };
+      sets.push(set2);
+    }
+
+    // Super tie (only if needed)
+    if (m.superNeeded) {
+      sets.push({ setNumber: 3, superTieBreak: { playerAScore: m.s3a, playerBScore: m.s3b } });
+    }
+
+    const payload = {
+      matchDate: new Date().toISOString().substring(0, 10),
+      players: { playerA: { name: $("playerA").value }, playerB: { name: $("playerB").value } },
+      sets,
+      comments: $("comments").value,
+      matchType: m.type,
+      status: m.status,
+      winner: m.winner
+    };
+
+    const res = await fetch(API + "/matches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (res.ok) {
+      alert("OK - salvo no Cosmos");
+      $("form").reset();
+      updateUI();
+    } else {
+      const txt = await res.text().catch(() => "");
+      alert("Erro ao salvar: HTTP " + res.status + (txt ? (" - " + txt) : ""));
+    }
+  });
+
+  // --- GET list + AI refresh ---
+  $("load").addEventListener("click", async () => {
+    const month = $("month").value.trim();
+    const res = await fetch(API + "/matches/" + month);
+    const data = await res.json();
+
+    loadedMatches = Array.isArray(data) ? data : [];
+    $("games").innerHTML = "";
+
+    loadedMatches.forEach(g => {
+      let winnerName = "-";
+      if (g.winner === "playerA") winnerName = g.players.playerA.name;
+      if (g.winner === "playerB") winnerName = g.players.playerB.name;
+
+      const setsHtml = (g.sets || []).map(s => {
+        if (s.superTieBreak) {
+          return "Set " + s.setNumber + ": Super " + s.superTieBreak.playerAScore + " x " + s.superTieBreak.playerBScore;
+        }
+        const tb = s.tieBreak ? (" (TB " + s.tieBreak.playerAScore + " x " + s.tieBreak.playerBScore + ")") : "";
+        return "Set " + s.setNumber + ": " + s.playerAScore + " x " + s.playerBScore + tb;
+      }).join("<br/>");
+
+      const div = document.createElement("div");
+      div.className = "card";
+      div.innerHTML =
+        "<strong>" + g.players.playerA.name + "</strong> x <strong>" + g.players.playerB.name + "</strong><br/>" +
+        setsHtml + "<br/>" +
+        "Status: " + (g.status || "-") + "<br/>" +
+        "Vencedor: " + winnerName + "<br/>" +
+        "Comentário: " + (g.comments || "-");
+      $("games").appendChild(div);
+    });
+
+    refreshAIInsights();
+  });
+
+  // --- AI Simple ---
+  function analyzeMatches(matches, myName, opponent) {
+  const filtered = matches.filter(m => {
+    const a = normalize(m.players.playerA.name);
+    const b = normalize(m.players.playerB.name);
+    const me = normalize(myName);
+    const opp = normalize(opponent);
+
+    if (opponent) {
+      const hasOpp = (a === opp || b === opp);
+      const hasMe = (a === me || b === me);
+      return hasOpp && hasMe;
+    }
+    return true;
+  });
+
+    let wins = 0, losses = 0;
+    let tiePlayed = 0, tieWon = 0;
+    let superPlayed = 0, superWon = 0;
+
+    function didIWin(m) {
+      const isA = (normalize(m.players.playerA.name) === normalize(myName));
+      return (m.winner === "playerA" && isA) || (m.winner === "playerB" && !isA);
+    }
+
+    filtered.forEach(m => {
+      if (!m.winner) return;
+      if (didIWin(m)) wins++; else losses++;
+
+      const isA = (m.players.playerA.name === myName);
+
+      (m.sets || []).forEach(s => {
+        if (s.superTieBreak) {
+          superPlayed++;
+          const a = s.superTieBreak.playerAScore;
+          const b = s.superTieBreak.playerBScore;
+          const iWon = (isA && a > b) || (!isA && b > a);
+          if (iWon) superWon++;
+        } else if (s.tieBreak) {
+          tiePlayed++;
+          const a = s.tieBreak.playerAScore;
+          const b = s.tieBreak.playerBScore;
+          const iWon = (isA && a > b) || (!isA && b > a);
+          if (iWon) tieWon++;
+        }
+      });
+    });
+
+    const total = wins + losses;
+    return {
+      games: total,
+      wins, losses,
+      winRate: total ? (wins / total) : 0,
+      tiePlayed, tieWon,
+      superPlayed, superWon
+    };
+  }
+
+
+
+function buildAIPayload(stats, period, player, opponent) {
+  return {
+    period,
+    player,
+    analysisType: opponent ? "head-to-head" : "overall",
+    opponent: opponent || null,
+    stats: {
+      games: stats.games,
+      wins: stats.wins,
+      losses: stats.losses,
+      winRate: Number(stats.winRate.toFixed(2)),
+      tieBreaks: {
+        played: stats.tiePlayed,
+        won: stats.tieWon
+      },
+      superTieBreaks: {
+        played: stats.superPlayed,
+        won: stats.superWon
+      }
+    }
+  };
+}
+
+
+
+
+async function callAIInsights() {
+  if (!loadedMatches.length) {
+    $("aiInsights").innerText = "Carregue jogos primeiro.";
+    return;
+  }
+
+  // 🔥 CORREÇÃO: garantir consistência do player
+  const myName = ($("playerA").value || "").trim() || loadedMatches[0].players.playerA.name;
+  const opponent = $("opponentFilter").value || "";
+
+  const stats = analyzeMatches(
+    loadedMatches,
+    myName,
+    opponent
+  );
+
+  const payload = buildAIPayload(
+    stats,
+    $("month").value,
+    myName,
+    opponent
+  );
+
+  $("aiInsights").innerText = "🧠 Analisando com IA...";
+
+  const res = await fetch(API + "/ai/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+const data = await res.json();
+$("aiInsights").innerText = data.insight;
+
+// ✅ Salvar insight no Cosmos DB
+await fetch(API + "/ai/insights", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    player: myName,
+    analysisType: opponent ? "head-to-head" : "overall",
+    opponent: opponent || null,
+    period: $("month").value,
+    stats,
+    insightText: data.insight
+  })
+});
+}
+
+
+
+
+
+
+  function generateInsight(stats, opponent) {
+    if (!stats.games) return "Sem jogos finalizados suficientes para analisar (carregue jogos e/ou finalize partidas).";
+
+    const pct = Math.round(stats.winRate * 100);
+    let text = opponent ? ("Contra " + opponent + ", ") : "No geral, ";
+
+    if (stats.winRate >= 0.7) text += "você está bem consistente. ";
+    else if (stats.winRate >= 0.5) text += "seu desempenho está equilibrado. ";
+    else text += "há espaço claro para evoluir. ";
+
+    text += "Vitórias: " + stats.wins + " de " + stats.games + " (" + pct + "%). ";
+
+    if (stats.tiePlayed) text += "Tie-breaks: " + stats.tieWon + "/" + stats.tiePlayed + ". ";
+    if (stats.superPlayed) text += "Super tie-breaks: " + stats.superWon + "/" + stats.superPlayed + ". ";
+
+    return text;
+  }
+
+  function refreshAIInsights() {
+    if (!loadedMatches.length) {
+      $("aiInsights").innerText = "Carregue jogos (Buscar) para gerar insights.";
+      $("opponentFilter").innerHTML = '<option value="">Geral (jogos carregados)</option>';
+      return;
+    }
+
+const myNameRaw = ($("playerA").value || "").trim() || loadedMatches[0].players.playerA.name;
+const myName = normalize(myNameRaw);
+
+const opponents = new Set();
+
+loadedMatches.forEach(m => {
+  const aRaw = m.players.playerA.name;
+  const bRaw = m.players.playerB.name;
+
+  const a = normalize(aRaw);
+  const b = normalize(bRaw);
+
+  if (a && a !== myName) opponents.add(aRaw); // mantém original pra UI
+  if (b && b !== myName) opponents.add(bRaw);
+});
+
+    const select = $("opponentFilter");
+    const keep = select.value || "";
+    select.innerHTML = '<option value="">Geral (jogos carregados)</option>';
+    Array.from(opponents).sort().forEach(o => {
+      const opt = document.createElement("option");
+      opt.value = o;
+      opt.textContent = o;
+      select.appendChild(opt);
+    });
+    if (keep) select.value = keep;
+
+    const opponent = select.value || "";
+    const stats = analyzeMatches(loadedMatches, myName, opponent);
+    $("aiInsights").innerText = generateInsight(stats, opponent);
+  }
+
+// $("refreshInsights").addEventListener("click", refreshAIInsights);
+$("refreshInsights").addEventListener("click", callAIInsights);  
+$("opponentFilter").addEventListener("change", callAIInsights);
+
+  // listeners
+  [
+    "s1a","s1b","s2a","s2b","tb1a","tb1b","tb2a","tb2b","s3a","s3b","playerA","playerB"
+  ].forEach(id => $(id).addEventListener("input", updateUI));
+
+  document.querySelectorAll('input[name="matchType"]').forEach(r => r.addEventListener("change", updateUI));
+
+  // init
+  updateUI();
+</script>
+
+</body>
+</html>
